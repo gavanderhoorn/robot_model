@@ -8,6 +8,7 @@ import xml.dom.minidom
 from sensor_msgs.msg import JointState
 from math import pi
 from threading import Thread
+import cexprtk
 
 RANGE = 10000
 
@@ -35,6 +36,8 @@ class JointStatePublisher():
         pub_def_positions = get_param("publish_default_positions", True)
         pub_def_vels = get_param("publish_default_velocities", False)
         pub_def_efforts = get_param("publish_default_efforts", False)
+
+        self.symb_table = {}
 
         # Find all non-fixed joints
         for child in robot.childNodes:
@@ -75,6 +78,19 @@ class JointStatePublisher():
                     if tag.hasAttribute('offset'):
                         entry['offset'] = float(tag.getAttribute('offset'))
 
+                    # store expression
+                    if tag.hasAttribute('expr'):
+                        entry['expr_str'] = tag.getAttribute('expr')
+                    else:
+                        # construct an expression (bw compatibility with default mimic joint spec)
+                        entry['expr_str'] = "({}_q * {}) + {}".format(
+                            entry['parent'],
+                            entry.get('factor', 1.0),
+                            entry.get('offset', 0.0)
+                        )
+
+                    self.symb_table[name + '_q'] = 0
+
                     self.dependent_joints[name] = entry
                     continue
 
@@ -96,9 +112,24 @@ class JointStatePublisher():
                 if pub_def_efforts:
                     joint['effort'] = 0.0
 
+
+                self.symb_table[name + '_q'] = zeroval
+
+
                 if jtype == 'continuous':
                     joint['continuous'] = True
                 self.free_joints[name] = joint
+
+
+        # exprtk magic
+        self.expr_st = cexprtk.Symbol_Table(self.symb_table, add_constants= True)
+
+        for name, joint in self.dependent_joints.iteritems():
+            if 'expr_str' in joint:
+                print ("{} expr: '{}'".format(name, joint['expr_str']))
+                joint['expr'] = cexprtk.Expression(str(joint['expr_str']), self.expr_st)
+                pass
+
 
 
         use_gui = get_param("use_gui", False)
@@ -203,10 +234,27 @@ class JointStatePublisher():
 
                 if has_position and 'position' in joint:
                     msg.position[i] = joint['position'] * factor + offset
+
+                    # update value in symbol table
+                    if name in self.free_joints:
+                        self.expr_st.variables[name + '_q'] = joint['position']
+
                 if has_velocity and 'velocity' in joint:
                     msg.velocity[i] = joint['velocity'] * factor
                 if has_effort and 'effort' in joint:
                     msg.effort[i] = joint['effort']
+
+
+            for i, name in enumerate(self.joint_list):
+                if name in self.dependent_joints:
+                    joint = self.dependent_joints[name]
+                    # make sure mimic joint has an expression set
+                    if 'expr' in joint:
+                        expr = self.dependent_joints[name].get('expr')
+                        if expr:
+                            msg.position[i] = expr()
+
+
 
             self.pub.publish(msg)
             r.sleep()
